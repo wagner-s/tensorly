@@ -437,3 +437,122 @@ def randomised_parafac(tensor, rank, n_samples, n_iter_max=100, init='random', s
                     break
 
     return factors
+
+def _parafac2(X, r=2, tol=1e-5, verbose=True):
+    from functools import reduce
+    m = len(X)
+    F = np.identity(r)
+    D = np.ones((m, r))
+    A = np.linalg.eigh(reduce(lambda A, B: A + B, map(lambda Xi: Xi.T.dot(Xi), X)))
+    A = A[1][:, np.argsort(A[0])][:, -r:]
+
+    H = [np.linalg.qr(Xi, mode='r') if Xi.shape[0] > Xi.shape[1] else Xi for Xi in X]
+    G = [np.identity(r), np.identity(r), np.ones((r, r)) * m]
+
+    err = 1
+    conv = False
+    niters = 0
+    while not conv and niters < 100:
+        P = [np.linalg.svd((F * D[i, :]).dot(H[i].dot(A).T), full_matrices=0) for i in range(m)]
+        P = [(S[0].dot(S[2])).T for S in P]
+        T = np.array([P[i].T.dot(H[i]) for i in range(m)])
+
+        F = np.reshape(np.transpose(T, (0, 2, 1)), (-1, T.shape[1])).T.dot( _KhatriRao(D, A)).dot(np.linalg.pinv(G[2] * G[1]))
+        G[0] = F.T.dot(F)
+        A = np.reshape(np.transpose(T, (0, 1, 2)), (-1, T.shape[2])).T.dot( _KhatriRao(D, F)).dot(np.linalg.pinv(G[2] * G[0]))
+        G[1] = A.T.dot(A)
+        D = np.reshape(np.transpose(T, (2, 1, 0)), (-1, T.shape[0])).T.dot( _KhatriRao(A, F)).dot(np.linalg.pinv(G[1] * G[0]))
+        G[2] = D.T.dot(D)
+        err_old = err
+        err = np.sum(np.sum((H[i] - (P[i].dot(F) * D[i, :]).dot(A.T)) ** 2) for i in range(m))
+        niters += 1
+        conv = abs(err_old - err) < tol * err_old
+        if verbose: print("Iteration {0}; error = {1:.6f}".format(niters, err))
+
+    P = [np.linalg.svd((F * D[i, :]).dot(X[i].dot(A).T), full_matrices=0) for i in range(m)]
+    F = [(S[0].dot(S[2])).T.dot(F) for S in P]
+    return F, D, A
+
+def _KhatriRao(A, B):
+    return np.repeat(A, B.shape[0], axis=0) * np.tile(B, (A.shape[0], 1))
+
+def parafac2(X, r=2, tol=1e-5, verbose=True, svd='numpy_svd'):
+    from functools import reduce
+
+    try:
+        svd_fun = tl.SVD_FUNS[svd]
+    except KeyError:
+        message = 'Got svd={}. However, for the current backend ({}), the' \
+                   ' possible choices are {}'.format(svd,                  \
+                    tl.get_backend(), tl.SVD_FUNS)
+        raise ValueError(message)
+    m = len(X)
+    # XXX: not available in tl
+    F = np.identity(r)
+    # np -> tl
+    # np: numpy.ones(shape, dtype=None, order='C')
+    # tl: ones(shape, dtype=None)
+    D = tl.ones((m, r))
+    # XXX: not available in tl, core backend uses eigsh from scipy
+    A = np.linalg.eigh(reduce(lambda A, B: A + B, map(lambda Xi: Xi.T.dot(Xi), X)))
+    # XXX: not available in tl
+    A = A[1][:, np.argsort(A[0])][:, -r:]
+    # np -> tl
+    # np:  numpy.linalg.qr(a, mode='reduced')
+    # tl:  qr(a)
+    H = [np.linalg.qr(Xi, mode='r') if Xi.shape[0] > Xi.shape[1] else Xi for Xi in X]
+    # XXX: identity not available in tl, ones -> tl
+    G = [np.identity(r), np.identity(r), tl.ones((r, r)) * m]
+
+    err = 1
+    conv = False
+    niters = 0
+    while not conv and niters < 100:
+        # np -> tl
+        # np:  ndarray.dot(b, out=None)
+        # tl:  dot(a, b)
+        # np: np.linalg.svd
+        # tl: tl.SVD_FUN['numpy_svd'] -> partial_svd? XXX: can this be mapped w/ parameter for n_eigenvecs?
+        P = [np.linalg.svd(tl.dot(F * D[i, :], tl.dot(H[i], A).T), full_matrices=False) for i in range(m)]
+        # np -> tl: dot
+        P = [tl.dot(S[0], S[2]).T for S in P]
+        # np -> tl: dot
+        T = np.array([tl.dot(P[i].T, H[i]) for i in range(m)])
+
+        # np -> tl:
+        # np:  numpy.reshape(a, newshape, order='C')
+        # tl:  reshape(tensor, newshape)
+        # XXX: transpose not completely supported
+        # np:  numpy.transpose(a, axes=None)
+        # tl: transpose(tensor)
+        # XXX: pinv
+        # np:  numpy.linalg.pinv(a, rcond=1e-15)
+        F = tl.reshape(
+            np.transpose(T, (0, 2, 1)),
+            (-1, T.shape[1])).T.dot( _KhatriRao(D, A)).dot(np.linalg.pinv(G[2] * G[1]))
+        # np -> tl: dot
+        G[0] = tl.dot(F.T, F)
+        # np -> tl: reshape
+        A = tl.reshape(np.transpose(T, (0, 1, 2)), (-1, T.shape[2])).T.dot( _KhatriRao(D, F)).dot(np.linalg.pinv(G[2] * G[0]))
+        # np -> tl: dot
+        G[1] = tl.dot(A.T, A)
+        # np -> tl: reshape
+        D = tl.reshape(np.transpose(T, (2, 1, 0)), (-1, T.shape[0])).T.dot( _KhatriRao(A, F)).dot(np.linalg.pinv(G[1] * G[0]))
+        # np -> tl: dot
+        G[2] = tl.dot(D.T, D)
+        err_old = err
+        # np -> tl: dot
+        # np -> tl
+        # np:  numpy.sum(a, axis=None, dtype=None, out=None, keepdims=<no value>, initial=<no value>)
+        # tl:  sum(tensor, axis=None)
+        err = tl.sum(tl.sum((H[i] - tl.dot(tl.dot(P[i], F) * D[i, :], A.T)) ** 2) for i in range(m))
+        niters += 1
+        conv = abs(err_old - err) < tol * err_old
+        if verbose: print("Iteration {0}; error = {1:.6f}".format(niters, err))
+
+    # XXX: which SVD?
+    # np -> tl: dot, svd
+    P = [np.linalg.svd(tl.dot(F * D[i, :], tl.dot(X[i], A).T), full_matrices=False) for i in range(m)]
+    # np -> tl: dot
+    F = [tl.dot((tl.dot(S[0], S[2])).T, F) for S in P]
+    return F, D, A
